@@ -1,13 +1,15 @@
+use std::borrow::BorrowMut;
 use std::io::Read;
-use std::net::{TcpListener, TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, sleep};
+use std::time::Duration;
 
 use anyhow::bail;
+use base64::prelude::*;
 use boringtun::noise::rate_limiter::RateLimiter;
 use boringtun::noise::{self, Tunn, TunnResult};
 use boringtun::x25519::{self, PublicKey, StaticSecret};
-use base64::prelude::*;
 
 #[derive(Clone)]
 pub struct Wireguard {
@@ -17,16 +19,19 @@ pub struct Wireguard {
     virtual_ip: String,
 }
 
+#[derive(Clone)]
 pub struct Tunnel {
-    tun: Tunn, // 1. MUTEX THIS; 2. TRY HANDSHAKE 3. FIGURE OUT HOW TO SEND DESTINATION PATH TO WIREGUARD
+    tun: Arc<Mutex<Tunn>>, // 1. MUTEX THIS; 2. TRY HANDSHAKE 3. FIGURE OUT HOW TO SEND DESTINATION PATH TO WIREGUARD
     socket: Arc<Mutex<UdpSocket>>,
 }
 
 impl Tunnel {
     pub fn new(wg: Wireguard) -> anyhow::Result<Self> {
-        let socket: UdpSocket = UdpSocket::bind("0.0.0.0:0").unwrap();
+        let socket: UdpSocket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).unwrap();
         match socket.connect(wg.endpoint.clone()) {
             Ok(a) => {
+                socket.set_read_timeout(Some(Duration::from_millis(1000)));
+                socket.set_write_timeout(Some(Duration::from_millis(1000)));
                 println!("wg socket connected");
             }
             Err(_) => {
@@ -42,7 +47,10 @@ impl Tunnel {
         let public = PublicKey::from(wg.public_key);
 
         match Tunn::new(secret, public, None, Some(5), 0, None) {
-            Ok(tun) => Ok(Self { tun, socket: Arc::new(Mutex::new(socket)) }),
+            Ok(tun) => Ok(Self {
+                tun: Arc::new(Mutex::new(tun)),
+                socket: Arc::new(Mutex::new(socket)),
+            }),
             Err(err) => bail!("tunnel error: {}", err),
         }
     }
@@ -76,34 +84,54 @@ impl Tunnel {
         }
     */
 
-    pub fn create_handshake_init(mut self) {
+    pub fn create_handshake_init(&mut self) {
         let mut dst = vec![0u8; 2048];
-        let handshake_init = self.tun.format_handshake_initiation(&mut dst, false);
-        let handshake_init = if let TunnResult::WriteToNetwork(sent) = handshake_init {
-            {
-                let socket = self.socket.lock().unwrap();
-                socket.send(&sent).unwrap();
-            }
-        } else {
-            unreachable!();
-        };
+        let mut tun = self.tun.lock().unwrap();
+        let handshake_init = tun.format_handshake_initiation(&mut dst, false);
+        
+        match handshake_init {
+            TunnResult::Done => {
+                sleep(Duration::from_millis(1));
+            },
+            TunnResult::Err(wire_guard_error) => {println!("Error: {:?}",wire_guard_error);},
+            TunnResult::WriteToNetwork(sent) => {
+                
+                loop {
+                    match self.socket.try_lock() {
+                        Ok(socket) => {
+                            socket.send(&sent).unwrap();
+                            println!("Handshake sent!");
+                            break;
+                        }
+                        Err(_) => {
+                            sleep(Duration::from_millis(10));
+                        }
+                    }
+                }
+            },
+            _ => {println!("unexpected wireguard routing task");},
+        }
+
     }
 
-    pub fn udp_rec_loop(mut self) {
+    pub fn udp_rec_loop(&mut self) {
         let socket = Arc::clone(&self.socket);
-        thread::spawn(move || {
-            let socket = Arc::clone(&socket);
-            let mut buf = [0u8; 65536];
-            loop {
-                {
-                    match socket.try_lock() {
-                        Ok(socket) => {
-                            match socket.recv(&mut buf) {
-                                Ok(_) => {
+        thread::spawn({
+            let self1 = self.clone();
+            move || {
+                let socket = Arc::clone(&socket);
+                let mut buf = [0u8; 65536];
+                loop {
+                    {
+                        match socket.try_lock() {
+                            Ok(socket) => match socket.recv(&mut buf) {
+                                Ok(n) => {
+                                    println!("Received: {:?}", n);
                                     let mut packet = [0u8; 65536];
-                                    match self.tun.decapsulate(
+                                    let mut tun = self1.tun.lock().unwrap();
+                                    match tun.decapsulate(
                                         Some(socket.local_addr().unwrap().ip()),
-                                        &buf,
+                                        &buf[..n],
                                         &mut packet,
                                     ) {
                                         boringtun::noise::TunnResult::Done => {
@@ -112,8 +140,18 @@ impl Tunnel {
                                         boringtun::noise::TunnResult::Err(_) => {
                                             continue;
                                         }
-                                        boringtun::noise::TunnResult::WriteToNetwork(_) => {
-                                            socket.send(&packet).unwrap();
+                                        boringtun::noise::TunnResult::WriteToNetwork(sent_buf) => {
+                                            loop {
+                                                match socket.send(&sent_buf) {
+                                                    Ok(a) => { 
+                                                        println!("Packet sent: {a}");
+                                                        break;
+                                                    }
+                                                    Err(_) => {
+                                                        sleep(Duration::from_millis(10));
+                                                    }
+                                                }
+                                            }
                                         }
                                         boringtun::noise::TunnResult::WriteToTunnelV4(
                                             packet,
@@ -129,14 +167,17 @@ impl Tunnel {
                                         }
                                     }
                                 }
-                                Err(_) => {}
-                            };
-                        }
-                        Err(_) => {
-                            println!("lock");
-                            continue;
+                                Err(_) => {
+                                    println!("Ehhh");
+                                }
+                            },
+                            Err(_) => {
+                                println!("lock");
+                                continue;
+                            }
                         }
                     }
+                    sleep(Duration::from_millis(11));
                 }
             }
         });
@@ -144,12 +185,7 @@ impl Tunnel {
 }
 
 impl Wireguard {
-    pub fn new(
-        private_key: &str,
-        public_key: &str,
-        endpoint: &str,
-        virtual_ip: &str,
-    ) -> Self {
+    pub fn new(private_key: &str, public_key: &str, endpoint: &str, virtual_ip: &str) -> Self {
         let mut private_key_buf = [0u8; 32];
         let mut public_key_buf = [0u8; 32];
 
