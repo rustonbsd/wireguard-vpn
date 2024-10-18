@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 boringtun ={ version = "0.6.0" }
 anyhow = { version = "1" }
+base64 = { version = "0.22.1" }
