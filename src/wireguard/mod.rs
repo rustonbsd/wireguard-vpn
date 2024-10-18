@@ -1,3 +1,4 @@
+use std::any;
 use std::borrow::BorrowMut;
 use std::io::Read;
 use std::net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket};
@@ -7,6 +8,7 @@ use std::time::Duration;
 
 use anyhow::bail;
 use base64::prelude::*;
+use boringtun::noise::errors::WireGuardError;
 use boringtun::noise::rate_limiter::RateLimiter;
 use boringtun::noise::{self, Tunn, TunnResult};
 use boringtun::x25519::{self, PublicKey, StaticSecret};
@@ -54,38 +56,105 @@ impl Tunnel {
             Err(err) => bail!("tunnel error: {}", err),
         }
     }
-    /*
-        async fn udp_send_loop(mut self, socket: Arc<Mutex<UdpSocket>>) {
-            thread::spawn(move || {
-                let socket = Arc::clone(&socket);
-                let mut buf = [0u8; 65536];
-                let mut send_buf = [0u8; 65536];
+    
+    pub fn udp_send_ip_packet(&mut self, packet: &[u8], wg: &Wireguard) -> anyhow::Result<()> {
+        let mut sent = [0u8; 65536];
+        let enc_res = {
+            match self.tun.try_lock() {
+                Ok(mut tun) => {
+                    tun.encapsulate(&packet, &mut sent)
+                },
+                Err(_) => {
+                    println!("failed to lock tun device udp_send_ip_packet");
+                    bail!("failed to lock tun device!")
+                },
+            }
+        };
 
+        match enc_res {
+            TunnResult::WriteToNetwork(packet) => {
                 loop {
-                    let n = match self.test_socket.read(&mut buf) {
-                        Ok(n) => n,
-                        Err(_) => continue,
-                    };
+                    let socket = Arc::clone(&self.socket);
 
-                    match self.tun.encapsulate(&buf[..n], &mut send_buf) {
-                        boringtun::noise::TunnResult::WriteToNetwork(packet) => {
-                            {
-                                let socket = socket.lock().unwrap();
-                                socket.send(&packet).unwrap();
+                    {
+                        let socket = match socket.try_lock() {
+                            Ok(socket) => socket,
+                            Err(_) => continue,
+                        };
+
+                        match socket.send_to(&packet, wg.endpoint.clone()) {
+                            Ok(a) => { 
+                                println!("Packet sent: {a} (udp_send_ip_packet)");
+                                break;
                             }
-                        },
-                        _ => {
-                            println!("other encap");
+                            Err(_) => {
+                                sleep(Duration::from_millis(10));
+                            }
                         }
                     }
-
                 }
-            });
+            },
+            _ => {
+                println!("udp_send_ip_packet other");
+            }
         }
-    */
 
-    pub fn maintainance_loop() {
-        
+        Ok(())
+    }
+
+    pub fn maintainance_loop(&mut self, wg: &Wireguard) {
+        let socket = Arc::clone(&self.socket);
+        thread::spawn({
+            let self1 = self.clone();
+            let wg = wg.clone();
+            move || {
+                let socket = Arc::clone(&socket);
+                let mut sent = [0u8; 65536];
+                loop {
+                    {
+                        match self1.tun.try_lock() {
+                            Ok(mut tun) => {
+                                
+                                match tun.update_timers(&mut sent) {
+                                    TunnResult::Done => { sleep(Duration::from_millis(1)); },
+                                    TunnResult::Err(WireGuardError::ConnectionExpired) => {
+                                        println!("routine failed: re-initialization with handshake needed");
+
+                                    },
+                                    TunnResult::Err(wire_guard_error) => {
+                                        println!("routine failed: other error: {:?}",wire_guard_error);
+                                    },
+                                    TunnResult::WriteToNetwork(packet) => {
+                                        {
+                                            loop {
+                                                match socket.try_lock() {
+                                                    Ok(socket) => match socket.send_to(&packet, wg.endpoint.clone()) {
+                                                        Ok(n) => {
+                                                            println!("maintainance sent: {n}");
+                                                            break
+                                                        },
+                                                        Err(_) => { println!("maintainance failed to sent!"); },
+                                                    },
+                                                    Err(_) => {
+                                                        sleep(Duration::from_millis(10)); 
+                                                        continue
+                                                    },
+                                                };
+                                            }
+                                        }
+                                    },
+                                    _ => {println!("maintainance other"); },
+                                };
+                            },
+                            Err(_) => {
+                                //println!("lock failed: tun.update_timers err");
+                                },
+                        };
+                    }
+                }
+                
+            }
+        });
     }
 
     pub fn create_handshake_init(&mut self) {
@@ -176,7 +245,7 @@ impl Tunnel {
                                 }
                             },
                             Err(_) => {
-                                println!("lock");
+                                //println!("lock");
                                 continue;
                             }
                         }
