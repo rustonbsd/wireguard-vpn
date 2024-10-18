@@ -10,9 +10,11 @@ fn main() {
     "10.0.0.2")).unwrap();
     
     {
+        let mut tun = tun.clone();
         tun.udp_rec_loop();
     }
     {
+        let mut tun = tun.clone();
         tun.create_handshake_init();
     }
 
